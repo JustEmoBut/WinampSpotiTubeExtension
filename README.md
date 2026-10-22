@@ -34,13 +34,13 @@ Two Winamp plugins: `in_spotitube.dll` plays Spotify tracks, albums, playlists a
 
 ### 1. Install
 
-1. Download `SpotiTube-<version>.zip` from the [latest release](https://github.com/JustEmoBut/WinampSpotifyExtension/releases/latest) and extract it.
+1. Download `SpotiTube-<version>.zip` from the [latest release](https://github.com/JustEmoBut/WinampSpotiTubeExtension/releases/latest) and extract it.
 2. **Winamp not installed yet?** Download the Winamp setup from the official site, [winamp.com](https://www.winamp.com), and put it **in the same folder as `install.bat`**. Keep its file name starting with `winamp` (e.g. `winamp_latest_full.exe`). Don't use setups from other sites: `install.bat` runs it with administrator rights.
 3. Double-click **`install.bat`**.
 
 The script:
 
-- finds Winamp (from the registry, or pass `/winamp "<folder>"`; a leftover folder without `winamp.exe` doesn't count). If Winamp isn't installed, it runs the Winamp setup (`winamp*.exe`) next to `install.bat` silently (your Downloads folder is checked too);
+- finds Winamp (from the registry, or pass `/winamp "<folder>"`; a leftover folder without `winamp.exe` doesn't count). If Winamp isn't installed, it runs the Winamp setup (`winamp*.exe`) next to `install.bat` silently after you confirm it (your Downloads folder is checked too);
 - asks for administrator rights and waits for Winamp to close;
 - [fixes Winamp's revoked certificate](#2-winamps-revoked-certificate) on `elevator.exe`;
 - removes the pre-rename `in_spotify.dll` if present, copies both plugins to `Winamp\Plugins`, installs yt-dlp/ffmpeg via winget if they're missing (accepting winget's source and package agreements) and offers to restart Winamp.
@@ -78,8 +78,8 @@ Notes:
 Winamp is a 32-bit application, so the plugin must be built for `i686` (already the default via `.cargo/config.toml`).
 
 ```powershell
-git clone https://github.com/JustEmoBut/WinampSpotifyExtension.git
-cd WinampSpotifyExtension
+git clone https://github.com/JustEmoBut/WinampSpotiTubeExtension.git
+cd WinampSpotiTubeExtension
 rustup target add i686-pc-windows-msvc
 cargo build --release --workspace
 .\install.bat

@@ -18,9 +18,9 @@ use crate::{
 const MB_SETFOREGROUND: u32 = 0x0001_0000;
 const MB_TOPMOST: u32 = 0x0004_0000;
 
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/JustEmoBut/WinampSpotifyExtension/releases/latest";
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/JustEmoBut/WinampSpotiTubeExtension/releases/latest";
 /// Only zips from this repository's releases are installed.
-const DOWNLOAD_PREFIX: &str = "https://github.com/JustEmoBut/WinampSpotifyExtension/releases/download/";
+const DOWNLOAD_PREFIX: &str = "https://github.com/JustEmoBut/WinampSpotiTubeExtension/releases/download/";
 /// Remembers the last version offered, so each release is offered only once.
 const NOTIFIED_FILE: &str = "update_notified";
 const MAX_API_BYTES: usize = 1024 * 1024;
@@ -196,7 +196,7 @@ mod tests {
     const HASH: &str = "e2f090855274ce17132cd2342ac519e6d1cd0115170203fd52a15f45ae282d98";
 
     fn release_json(tag: &str, assets: &str) -> String {
-        format!(r#"{{"html_url":"https://github.com/JustEmoBut/WinampSpotifyExtension/releases/tag/{tag}","tag_name":"{tag}","assets":[{assets}]}}"#)
+        format!(r#"{{"html_url":"https://github.com/JustEmoBut/WinampSpotiTubeExtension/releases/tag/{tag}","tag_name":"{tag}","assets":[{assets}]}}"#)
     }
 
     fn asset(name: &str, digest: &str) -> String {
