@@ -57,8 +57,12 @@ set "SETUP_TRIED=1"
 set "SETUP="
 for %%S in ("%HERE%winamp*.exe" "%USERPROFILE%\Downloads\winamp*.exe") do if not defined SETUP set "SETUP=%%~fS"
 if not defined SETUP goto no_winamp
-echo Winamp is not installed. Installing it silently from:
+echo Winamp is not installed. Found a Winamp setup:
 echo   %SETUP%
+rem Any winamp*.exe matches (Downloads can hold anything): run it only after the user confirms.
+set "ANSWER=n"
+set /p "ANSWER=Install Winamp silently from this file? [y/N] "
+if /i not "%ANSWER%"=="y" goto no_winamp
 echo   ^(Windows asks for administrator rights; this takes about 10 seconds.^)
 start "" /wait "%SETUP%" /S
 set "WINAMP="
@@ -93,7 +97,10 @@ rem started as cmd /C "script" args, and with a quoted argument cmd strips the f
 rem quote, so the script never runs.
 set "UPDATE_ARG="
 if defined UPDATE set "UPDATE_ARG= /update"
-powershell -NoProfile -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c \"\"%SELF%\" /%MODE%%UPDATE_ARG% /winamp \"%WINAMP%\"\"' -Verb RunAs" >nul 2>&1
+rem Paths go into a single-quoted PowerShell string: double any ' (e.g. C:\Users\O'Brien).
+set "SELF_PS=%SELF:'=''%"
+set "WINAMP_PS=%WINAMP:'=''%"
+powershell -NoProfile -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c \"\"%SELF_PS%\" /%MODE%%UPDATE_ARG% /winamp \"%WINAMP_PS%\"\"' -Verb RunAs" >nul 2>&1
 if errorlevel 1 (
     echo Could not get administrator rights. Right-click install.bat and choose "Run as administrator".
     goto fail
