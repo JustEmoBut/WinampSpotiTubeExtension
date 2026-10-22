@@ -137,16 +137,58 @@ fn memmgr() -> *mut Dispatchable {
     api(MEMMGR_GUID, &MEMMGR)
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut c_void;
+    fn QueueUserAPC(apc: unsafe extern "system" fn(usize), thread: *mut c_void, data: usize) -> u32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+}
+
+const THREAD_SET_CONTEXT: u32 = 0x0010;
+/// Winamp's main (UI) thread, opened once for QueueUserAPC.
+static MAIN_THREAD: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+fn main_thread() -> *mut c_void {
+    let cached = MAIN_THREAD.load(Ordering::SeqCst);
+    if !cached.is_null() {
+        return cached;
+    }
+    let handle = unsafe {
+        let id = GetWindowThreadProcessId(module().h_main_window, std::ptr::null_mut());
+        OpenThread(THREAD_SET_CONTEXT, 0, id)
+    };
+    // A racing caller may have stored one too; keeping a second handle open is harmless.
+    MAIN_THREAD.store(handle, Ordering::SeqCst);
+    handle
+}
+
 /// Tells Winamp the art for `file` changed, so skins ask for it again. Needed because Winamp
 /// asks when a track starts, before the Spotify cover URL is known.
-// ponytail: issued from a worker thread; gen_ff's art reload is thread-agnostic (threadpool +
-// APC to the main thread). Marshal to the UI thread if another consumer turns out not to be.
+/// Issued on Winamp's main thread: gen_ff's handler (`AlbumArt::corecb_onUrlChange`) touches
+/// unsynchronized state and waits on a semaphore while the syscb lock is held. Winamp's main
+/// loop waits alertably (`MWMO_ALERTABLE`), the same path gen_ff uses to deliver its art.
 pub fn art_updated(file: &str) {
+    let thread = main_thread();
+    if thread.is_null() {
+        return;
+    }
+    let data = Box::into_raw(Box::new(to_wide(file))) as usize;
+    if unsafe { QueueUserAPC(issue_art_updated, thread, data) } == 0 {
+        drop(unsafe { Box::from_raw(data as *mut Vec<u16>) });
+    }
+}
+
+unsafe extern "system" fn issue_art_updated(data: usize) {
+    // SAFETY: `data` is the Box queued by `art_updated`, delivered once.
+    let wide = unsafe { Box::from_raw(data as *mut Vec<u16>) };
     let syscb = api(SYSCB_GUID, &SYSCB);
     if syscb.is_null() {
         return;
     }
-    let wide = to_wide(file);
     let (mut event, mut msg) = (SYSCALLBACK_META, METADATA_ART_UPDATED);
     let (mut param1, mut param2) = (wide.as_ptr() as isize, 0isize);
     let mut ret = 0i32;
@@ -256,7 +298,12 @@ unsafe extern "system" {
     fn InternetReadFile(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32) -> i32;
     fn InternetSetOptionW(h: *mut c_void, option: u32, buf: *const c_void, len: u32) -> i32;
     fn InternetCloseHandle(h: *mut c_void) -> i32;
+    fn HttpQueryInfoW(h: *mut c_void, info: u32, buf: *mut c_void, len: *mut u32, index: *mut u32) -> i32;
 }
+
+const HTTP_QUERY_STATUS_CODE: u32 = 19;
+const HTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const HTTP_STATUS_OK: u32 = 200;
 
 const INTERNET_OPEN_TYPE_PRECONFIG: u32 = 0;
 const INTERNET_FLAG_NO_UI: u32 = 0x0000_0200;
@@ -282,7 +329,11 @@ pub fn download(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
         }
         let req = InternetOpenUrlW(net, url.as_ptr(), std::ptr::null(), 0, INTERNET_FLAG_NO_UI, 0);
         let mut out = Vec::new();
-        let mut ok = !req.is_null();
+        // An error page (404, rate limit) is not the requested file.
+        let (mut status, mut len) = (0u32, size_of::<u32>() as u32);
+        let mut ok = !req.is_null()
+            && HttpQueryInfoW(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, (&raw mut status).cast(), &mut len, std::ptr::null_mut()) != 0
+            && status == HTTP_STATUS_OK;
         let mut chunk = vec![0u8; READ_CHUNK];
         while ok {
             let mut n = 0u32;
@@ -310,5 +361,6 @@ mod tests {
     fn downloads_cover_live() {
         let bytes = download("https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg", MAX_IMAGE_BYTES).unwrap();
         assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF], "JPEG magic");
+        assert!(download("https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg", MAX_IMAGE_BYTES).is_none(), "404 page");
     }
 }
