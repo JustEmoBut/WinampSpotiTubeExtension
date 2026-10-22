@@ -2,17 +2,17 @@
 //! ffmpeg decodes it to raw 44.1 kHz 16-bit stereo PCM that goes through `write_pcm`.
 
 use std::io::{ErrorKind, Read};
-use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Stdio;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{LazyLock, Mutex};
 
+use crate::ytdlp::{self, tool};
 use crate::{
     LENGTH_MS, SAMPLE_RATE, forget_title, is_current, mark_title_pending, output_draining, post_eof,
     replace_current_entry, show_error, store_title, write_pcm,
 };
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 1152 stereo frames per read, enough for Winamp's vis (needs >= 576 samples).
 const CHUNK_BYTES: usize = 1152 * 4;
 const MS_PER_SEC: f64 = 1000.0;
@@ -40,11 +40,17 @@ pub struct Source {
 /// yt-dlp output (title, duration, channel, audio URL) resolved ahead of time for a video id.
 static PRELOADED: Mutex<Option<(String, Vec<String>)>> = Mutex::new(None);
 
-/// yt-dlp self-update (`-U`) is attempted at most once per Winamp session.
-static UPDATE_TRIED: AtomicBool = AtomicBool::new(false);
-
-/// Serializes background title lookups so a big playlist doesn't spawn dozens of yt-dlp processes.
-static TITLE_LOOKUP: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// Queue of (playlist key, video id) title lookups, served by one worker thread: a big playlist
+/// gets one yt-dlp at a time and one thread, not a thread per entry.
+static TITLE_QUEUE: LazyLock<Mutex<Sender<(String, String)>>> = LazyLock::new(|| {
+    let (tx, rx) = channel::<(String, String)>();
+    std::thread::spawn(move || {
+        for (key, id) in rx {
+            lookup_title(&key, &id);
+        }
+    });
+    Mutex::new(tx)
+});
 
 /// Accepts youtube.com/watch?v=, youtu.be/, /shorts/, music.youtube.com and /playlist?list= links.
 /// A watch link that also carries `list=` expands the playlist, unless it's an auto mix.
@@ -89,83 +95,9 @@ fn video_url(id: &str) -> String {
     format!("https://www.youtube.com/watch?v={id}")
 }
 
-fn tool(exe: &str) -> Command {
-    let mut cmd = Command::new(exe);
-    cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null());
-    cmd
-}
-
-/// yt-dlp with UTF-8 output. PYTHONIOENCODING/PYTHONUTF8 don't work here: non-ASCII
-/// characters get silently dropped; only `--encoding utf-8` keeps them.
-fn yt_dlp_command() -> Command {
-    let mut cmd = tool("yt-dlp");
-    cmd.args(["--encoding", "utf-8", "--no-warnings"]);
-    cmd
-}
-
 /// Runs yt-dlp on a single video and returns its stdout lines, or a user-facing error.
 fn yt_dlp(args: &[&str]) -> Result<Vec<String>, String> {
-    yt_dlp_raw(&[&["--no-playlist"], args].concat())
-}
-
-/// Runs yt-dlp; on failure, self-updates once per session and retries, since YouTube
-/// changes often break older yt-dlp versions.
-fn yt_dlp_raw(args: &[&str]) -> Result<Vec<String>, String> {
-    let first = run_yt_dlp(args);
-    match &first {
-        Err((_, true)) if self_update() => run_yt_dlp(args).map_err(|(msg, _)| msg),
-        _ => first.map_err(|(msg, _)| msg),
-    }
-}
-
-/// Error carries whether yt-dlp ran and failed (worth retrying after an update).
-fn run_yt_dlp(args: &[&str]) -> Result<Vec<String>, (String, bool)> {
-    let output = match yt_dlp_command().args(args).output() {
-        Ok(o) => o,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(("yt-dlp not found on PATH.
-Install: winget install yt-dlp.yt-dlp
-Then restart Winamp.".into(), false));
-        }
-        Err(e) => return Err((format!("yt-dlp failed to start: {e}"), false)),
-    };
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err((friendly_error(err.trim()), true));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect())
-}
-
-/// Common failures, matched on the reason text YouTube sends (yt-dlp passes it through).
-const KNOWN_ERRORS: &[(&str, &str)] = &[
-    ("confirm your age", "This video is age-restricted; YouTube only plays it for signed-in users."),
-    ("not a bot", "YouTube asked to confirm you're not a bot. Try again later."),
-    ("rate-limited", "YouTube is limiting requests from this connection for up to an hour. Try again later."),
-    ("Private video", "This video is private."),
-    ("not made this video available in your country", "This video isn't available in your country."),
-    ("geo restriction", "This video isn't available in your country."),
-    ("removed for violating", "This video was removed by YouTube."),
-    ("video is unavailable", "This video is unavailable (removed, or the link is wrong)."),
-];
-
-/// A short explanation for known yt-dlp failures, with yt-dlp's own message below it.
-fn friendly_error(stderr: &str) -> String {
-    match KNOWN_ERRORS.iter().find(|(needle, _)| stderr.contains(needle)) {
-        Some((_, text)) => format!("{text}\n\nyt-dlp: {stderr}"),
-        None => format!("yt-dlp: {stderr}"),
-    }
-}
-
-/// Runs `yt-dlp -U` the first time it's called; true if a newer version was installed.
-fn self_update() -> bool {
-    if UPDATE_TRIED.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    match tool("yt-dlp").arg("-U").output() {
-        // "yt-dlp is up to date" means retrying won't help.
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).contains("up to date"),
-        _ => false,
-    }
+    ytdlp::run(&[&["--no-playlist"], args].concat())
 }
 
 /// yt-dlp prints duration in seconds (may be fractional) or "NA".
@@ -198,13 +130,13 @@ pub fn play(id: String, key: String, generation: u64) {
             return;
         }
     };
+    if !is_current(generation) {
+        return;
+    }
     let [title, duration, channel, abr, url, ..] = lines.as_slice() else {
         show_error(&format!("yt-dlp: unexpected output for {id}"));
         return;
     };
-    if !is_current(generation) {
-        return;
-    }
     let length = duration_ms(duration);
     LENGTH_MS.store(length, Ordering::SeqCst);
     store_channel(&key, title, channel);
@@ -326,10 +258,12 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
 pub fn expand(list_id: String, generation: u64) {
     let url = format!("https://www.youtube.com/playlist?list={list_id}");
     // One field per line: titles and channel names may contain any separator.
-    let lines = match yt_dlp_raw(&["--flat-playlist", "--print", "id", "--print", "duration", "--print", "channel", "--print", "title", &url]) {
+    let lines = match ytdlp::run(&["--flat-playlist", "--print", "id", "--print", "duration", "--print", "channel", "--print", "title", &url]) {
         Ok(l) => l,
         Err(msg) => {
-            show_error(&msg);
+            if is_current(generation) {
+                show_error(&msg);
+            }
             return;
         }
     };
@@ -345,13 +279,14 @@ pub fn expand(list_id: String, generation: u64) {
         crate::TITLES.lock().unwrap().get_or_insert_default().insert(key.clone(), (title.to_owned(), duration_ms(duration)));
         entries.push(key);
     }
+    if !is_current(generation) {
+        return;
+    }
     if entries.is_empty() {
         show_error("No playable videos in this YouTube playlist.");
         return;
     }
-    if is_current(generation) {
-        replace_current_entry(&entries);
-    }
+    replace_current_entry(&entries);
 }
 
 /// The channel stands in for the artist; yt-dlp prints "NA" when it's unknown.
@@ -363,18 +298,20 @@ fn store_channel(key: &str, title: &str, channel: &str) {
 /// Looks up a video's title in the background (one yt-dlp at a time).
 pub fn request_title(key: &str, id: String) {
     mark_title_pending(key);
-    let key = key.to_owned();
-    std::thread::spawn(move || {
-        let _one_at_a_time = TITLE_LOOKUP.lock().unwrap();
-        match yt_dlp(&["--skip-download", "--print", "title", "--print", "duration", "--print", "channel", &video_url(&id)]) {
-            Ok(lines) if lines.len() >= 3 => {
-                store_channel(&key, &lines[0], &lines[2]);
-                store_title(&key, lines[0].clone(), duration_ms(&lines[1]));
-            }
-            // Leave the link as the title; Play() reports the actual error.
-            _ => forget_title(&key),
+    if TITLE_QUEUE.lock().unwrap().send((key.to_owned(), id)).is_err() {
+        forget_title(key); // worker gone; a later GetFileInfo asks again
+    }
+}
+
+fn lookup_title(key: &str, id: &str) {
+    match yt_dlp(&["--skip-download", "--print", "title", "--print", "duration", "--print", "channel", &video_url(id)]) {
+        Ok(lines) if lines.len() >= 3 => {
+            store_channel(key, &lines[0], &lines[2]);
+            store_title(key, lines[0].clone(), duration_ms(&lines[1]));
         }
-    });
+        // Leave the link as the title; Play() reports the actual error.
+        _ => forget_title(key),
+    }
 }
 
 #[cfg(test)]
@@ -416,16 +353,6 @@ mod tests {
         ] {
             assert!(parse(s).is_none(), "{s}");
         }
-    }
-
-    #[test]
-    fn explains_known_errors() {
-        // Real yt-dlp 2026.08.19 output.
-        let gone = "ERROR: [youtube] aaaaaaaaaaa: This video is unavailable";
-        assert_eq!(friendly_error(gone), format!("This video is unavailable (removed, or the link is wrong).\n\nyt-dlp: {gone}"));
-        let age = "ERROR: [youtube] 07FYdnEawAQ: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.";
-        assert!(friendly_error(age).starts_with("This video is age-restricted"));
-        assert_eq!(friendly_error("ERROR: something new"), "yt-dlp: ERROR: something new");
     }
 
     #[test]

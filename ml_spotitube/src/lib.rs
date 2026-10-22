@@ -2,10 +2,10 @@
 //! yt-dlp (`ytsearch`) and plays or enqueues results; in_spotitube.dll then plays the links.
 //! Struct layouts and message ids follow gen_ml/ml.h, gen_ml/ml_ipc_0313.h and Winamp/wa_ipc.h.
 
+#[path = "../../src/ytdlp.rs"]
+mod ytdlp;
+
 use std::ffi::c_void;
-use std::io::ErrorKind;
-use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
@@ -124,7 +124,6 @@ const SCROLLBAR_ALLOWANCE: i32 = 24;
 const CHANNEL_SHARE_PERCENT: i32 = 30;
 const MAX_RESULTS: u32 = 30;
 const SEARCH_FIELDS: usize = 4;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const QUERY_MAX: usize = 512;
 
 #[repr(C)]
@@ -386,8 +385,6 @@ static TREE_ID: AtomicUsize = AtomicUsize::new(0);
 static EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 /// Latest search; results of older searches are dropped.
 static SEARCH_ID: AtomicU64 = AtomicU64::new(0);
-/// yt-dlp self-update (`-U`) is attempted at most once per Winamp session.
-static UPDATE_TRIED: AtomicBool = AtomicBool::new(false);
 /// Finished search (id, first result index, result) waiting for the view thread to pick it up.
 type Pending = Option<(u64, usize, Result<Vec<Video>, String>)>;
 static PENDING: Mutex<Pending> = Mutex::new(None);
@@ -793,7 +790,8 @@ fn set_searching(hwnd: Hwnd, searching: bool) {
 
 unsafe fn show_results(hwnd: Hwnd, id: u64) {
     let pending = PENDING.lock().unwrap().take_if(|(p, _, _)| *p == id);
-    let Some((_, start, result)) = pending else { return };
+    // A newer search (source switch, Enter while searching) supersedes this one.
+    let Some((_, start, result)) = pending.filter(|_| id == SEARCH_ID.load(Ordering::SeqCst)) else { return };
     set_searching(hwnd, false);
     match result {
         Ok(videos) => {
@@ -921,29 +919,8 @@ fn add_videos(videos: &[Video], play: bool) {
 
 /// Runs `yt-dlp ytsearchN:<query>` for results `start+1..=start+MAX_RESULTS`; one field per
 /// line since titles may contain any separator.
-/// On failure, self-updates yt-dlp once per session and retries, since YouTube changes often
-/// break older versions (same policy as in_spotitube's playback).
+/// Self-updates yt-dlp and retries on failure (shared with in_spotitube's playback).
 fn search(query: &str, start: usize, music: bool) -> Result<Vec<Video>, String> {
-    match run_search_once(query, start, music) {
-        Err((_, true)) if self_update() => run_search_once(query, start, music).map_err(|(msg, _)| msg),
-        result => result.map_err(|(msg, _)| msg),
-    }
-}
-
-/// Runs `yt-dlp -U` the first time it's called; true if a newer version was installed.
-fn self_update() -> bool {
-    if UPDATE_TRIED.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    match Command::new("yt-dlp").creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).arg("-U").output() {
-        // "yt-dlp is up to date" means retrying won't help.
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).contains("up to date"),
-        _ => false,
-    }
-}
-
-/// Error carries whether yt-dlp ran and failed (worth retrying after an update).
-fn run_search_once(query: &str, start: usize, music: bool) -> Result<Vec<Video>, (String, bool)> {
     let end = start + MAX_RESULTS as usize;
     // YouTube Music's song search; its flat listing has no artist or duration ("NA").
     let target = if music {
@@ -951,25 +928,12 @@ fn run_search_once(query: &str, start: usize, music: bool) -> Result<Vec<Video>,
     } else {
         format!("ytsearch{end}:{query}")
     };
-    let output = Command::new("yt-dlp")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .args(["--encoding", "utf-8", "--no-warnings", "--flat-playlist"])
-        .args(["--print", "id", "--print", "duration", "--print", "channel", "--print", "title"])
-        .args(["-I", &format!("{}:", start + 1)])
-        .arg(target)
-        .output();
-    let output = match output {
-        Ok(o) => o,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(("yt-dlp not found on PATH.\nInstall: winget install yt-dlp.yt-dlp\nThen restart Winamp.".into(), false));
-        }
-        Err(e) => return Err((format!("yt-dlp failed to start: {e}"), false)),
-    };
-    if !output.status.success() {
-        return Err((format!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim()), true));
-    }
-    Ok(parse_results(&String::from_utf8_lossy(&output.stdout)))
+    // Bounded on both ends: the YT Music listing is otherwise paged through to ~500 results.
+    let range = format!("{}:{end}", start + 1);
+    let lines = ytdlp::run(&[
+        "--flat-playlist", "--print", "id", "--print", "duration", "--print", "channel", "--print", "title", "-I", &range, &target,
+    ])?;
+    Ok(parse_results(&lines))
 }
 
 /// Percent-encodes everything but unreserved characters (RFC 3986).
@@ -979,8 +943,7 @@ fn url_encode(s: &str) -> String {
         .collect()
 }
 
-fn parse_results(stdout: &str) -> Vec<Video> {
-    let lines: Vec<&str> = stdout.lines().collect();
+fn parse_results(lines: &[String]) -> Vec<Video> {
     lines
         .as_chunks::<SEARCH_FIELDS>()
         .0
@@ -1006,7 +969,7 @@ mod tests {
     #[test]
     fn parses_search_output() {
         let out = "jNQXAC9IVRw\n19.0\njawed\nMe at the zoo\nbadid\nNA\nNA\nskipped\nS020dzrrYW0\nNA\nNA\nLive | now\n";
-        let videos = parse_results(out);
+        let videos = parse_results(&out.lines().map(str::to_owned).collect::<Vec<_>>());
         assert_eq!(videos.len(), 2);
         assert_eq!(videos[0], Video { id: "jNQXAC9IVRw".into(), title: "Me at the zoo".into(), channel: "jawed".into(), length_secs: 19 });
         assert_eq!((videos[1].channel.as_str(), videos[1].length_secs, videos[1].title.as_str()), ("", -1, "Live | now"));

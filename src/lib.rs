@@ -7,6 +7,7 @@
 mod albumart;
 mod update;
 mod youtube;
+mod ytdlp;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -414,19 +415,14 @@ fn hook_stock_plugins() {
 
 /// Replaces the album/playlist entry at the current playlist position with its tracks, then plays.
 async fn expand_task(uri: SpotifyUri, generation: u64) {
-    let tracks = match expand(&uri).await {
-        Ok(t) if t.is_empty() => {
-            show_error("No playable tracks in this album/playlist/artist.");
-            return;
-        }
-        Ok(t) => t,
-        Err(msg) => {
-            show_error(&msg);
-            return;
-        }
-    };
-    if is_current(generation) {
-        replace_current_entry(&tracks);
+    let result = expand(&uri).await;
+    if !is_current(generation) {
+        return;
+    }
+    match result {
+        Ok(t) if t.is_empty() => show_error("No playable tracks in this album/playlist/artist."),
+        Ok(t) => replace_current_entry(&t),
+        Err(msg) => show_error(&msg),
     }
 }
 
@@ -777,16 +773,19 @@ impl Sink for WinampSink {
     }
 }
 
+/// Samples `write_pcm` allocates for `samples` input samples. DSP plugins may return up to twice
+/// as many samples, and SA/VSAAddPCMData always read VIS_MIN_FRAMES frames: librespot packets can
+/// be shorter, so zero-pad (Winamp otherwise reads past the buffer and corrupts the heap).
+fn pcm_buffer_len(samples: usize) -> usize {
+    (samples * 2).max(VIS_MIN_FRAMES * CHANNELS as usize)
+}
+
 /// Blocks until `pcm` (interleaved 16-bit stereo) is handed to Winamp's DSP, vis and output.
 /// Returns false if the output was closed, or `generation` stopped being current, meanwhile.
 fn write_pcm(pcm: &[i16], generation: Option<u64>) -> bool {
     let frames = pcm.len() / CHANNELS as usize;
-
-    // DSP plugins may return up to twice as many samples, and SA/VSAAddPCMData always read
-    // VIS_MIN_FRAMES frames: librespot packets can be shorter, so zero-pad (Winamp otherwise
-    // reads past the buffer and corrupts the heap).
     let mut buf = pcm.to_vec();
-    buf.resize((pcm.len() * 2).max(VIS_MIN_FRAMES * CHANNELS as usize), 0);
+    buf.resize(pcm_buffer_len(pcm.len()), 0);
 
     loop {
         {
@@ -1145,6 +1144,14 @@ mod tests {
         assert_eq!(web_url(r"C:\music\a.mp3"), None);
         assert_eq!(format_length(61_500), "1:01");
         assert_eq!(format_length(-1), "unknown");
+    }
+
+    #[test]
+    fn pads_pcm_for_dsp_and_vis() {
+        let vis_samples = VIS_MIN_FRAMES * CHANNELS as usize;
+        assert_eq!(pcm_buffer_len(20), vis_samples, "short packet still covers a full vis read");
+        assert_eq!(pcm_buffer_len(4096), 8192, "room for DSP doubling");
+        assert!(pcm_buffer_len(vis_samples) >= vis_samples * 2);
     }
 
     #[test]
